@@ -1,0 +1,72 @@
+.TH DISCORD_CREATE_MESSAGE 3 "2026-06-29" "libdiscord 0.1.0" "libdiscord Programmer's Manual"
+.SH NAME
+discord_create_message, discord_edit_message, discord_delete_message, discord_get_channel \\\\- Discord REST API helpers
+.SH SYNOPSIS
+.nf
+#include <discord.h>
+
+int discord_create_message(discord_ctx_t *ctx, const char *channel_id, const char *content);
+
+int discord_edit_message(discord_ctx_t *ctx, const char *channel_id,
+                         const char *message_id, const char *content);
+
+int discord_delete_message(discord_ctx_t *ctx, const char *channel_id,
+                           const char *message_id);
+
+int discord_get_channel(discord_ctx_t *ctx, const char *channel_id);
+.fi
+.SH DESCRIPTION
+These functions are thin convenience wrappers over librest's REST helpers. They generate HTTP/2 frames (via librest) for Discord REST API v10 endpoints. The caller owns all I/O — these functions only produce output bytes.
+
+.B discord_create_message
+prepares a POST request to /channels/{channel_id}/messages with JSON body {"content": "..."}. Automatically injects the Authorization header with the configured bot token.
+
+.B discord_edit_message
+prepares a PUT request to /channels/{channel_id}/messages/{message_id} with JSON body {"content": "..."}.
+
+.B discord_delete_message
+prepares a DELETE request to /channels/{channel_id}/messages/{message_id}.
+
+.B discord_get_channel
+prepares a GET request to /channels/{channel_id}.
+
+All functions return 0 on success, -1 on error (NULL ctx, NULL arguments, invalid state, or librest error).
+
+Output bytes (HTTP/2 frames) are available via discord_get_output(). API responses arrive as DISCORD_EVENT_API_RESPONSE events after the response frames are fed back via discord_feed_input().
+.SH RETURN VALUES
+0 on success, -1 on error.
+.SH EXAMPLES
+.nf
+/* Create a message */
+int rc = discord_create_message(bot, "123456789", "Hello, Discord!");
+if (rc != 0) { /* handle error */ }
+
+/* Extract HTTP/2 frames to send over network */
+uint8_t buf[8192];
+int n = discord_get_output(bot, buf, sizeof(buf));
+send_to_discord(buf, n);  /* caller's I/O */
+
+/* When response arrives, feed it back */
+discord_feed_input(bot, response_bytes, response_len);
+
+/* Process API response event */
+discord_event_t ev;
+while (discord_next_event(bot, &ev) == 1) {
+    if (ev.type == DISCORD_EVENT_API_RESPONSE) {
+        printf("Status: %d\\n", ev.data.api_response.status_code);
+    }
+}
+
+/* Edit a message */
+discord_edit_message(bot, "123456789", "msg_id_456", "Updated content!");
+
+/* Delete a message */
+discord_delete_message(bot, "123456789", "msg_id_456");
+
+/* Get channel info */
+discord_get_channel(bot, "123456789");
+.fi
+.SH SEE ALSO
+discord_create(3), discord_next_event(3), discord_get_output(3), rest_post_json(3), rest_put(3), rest_delete(3), rest_get(3)
+.SH NOTES
+These are pure plumbing helpers — they generate HTTP/2 frames but perform no I/O. The caller is responsible for sending the frames over the network and feeding responses back. Rate limiting (HTTP 429) is the caller's responsibility. Bot token must be configured via discord_create_with_config for auth headers to be injected.

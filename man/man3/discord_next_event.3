@@ -1,0 +1,68 @@
+.TH DISCORD_NEXT_EVENT 3 "2026-06-29" "libdiscord 0.1.0" "libdiscord Programmer's Manual"
+.SH NAME
+discord_next_event \\\\- retrieve next Discord protocol event from the context's queue
+.SH SYNOPSIS
+.nf
+#include <discord.h>
+
+int discord_next_event(discord_ctx_t *ctx, discord_event_t *event);
+.fi
+.SH DESCRIPTION
+Dequeues the next event (if any) into the caller-provided \\\\fBdiscord_event_t\\\\fP structure and returns 1. Returns 0 if the queue is empty or on invalid arguments (NULL ctx or event).
+
+Gateway lifecycle events:
+.IP \\(bu 2
+DISCORD_EVENT_READY \\\\(em Gateway READY received (user_id, session_id, gateway_url)
+.IP \\(bu 2
+DISCORD_EVENT_CONNECTED \\\\(em Binary channel established (Gateway or API)
+.IP \\(bu 2
+DISCORD_EVENT_DISCONNECTED \\\\(em Gateway disconnected (WebSocket close)
+
+Message events:
+.IP \\(bu 2
+DISCORD_EVENT_MESSAGE_CREATE \\\\(em New message (id, channel_id, guild_id, author_id, content, timestamp)
+.IP \\(bu 2
+DISCORD_EVENT_MESSAGE_UPDATE \\\\(em Message edited
+.IP \\(bu 2
+DISCORD_EVENT_MESSAGE_DELETE \\\\(em Message deleted
+
+Other events:
+.IP \\(bu 2
+DISCORD_EVENT_GUILD_CREATE \\\\(em Guild info received
+.IP \\(bu 2
+DISCORD_EVENT_INTERACTION_CREATE \\\\(em Slash command / component interaction
+.IP \\(bu 2
+DISCORD_EVENT_API_RESPONSE \\\\(em REST API response (status_code, json_body, body_len)
+.IP \\(bu 2
+DISCORD_EVENT_ERROR \\\\(em Error with detail string
+.IP \\(bu 2
+DISCORD_EVENT_RAW \\\\(em Raw unparseable WebSocket frame
+.SH RETURN VALUES
+1 if an event was copied into *event, 0 otherwise.
+.SH EXAMPLES
+.nf
+discord_event_t ev;
+while (discord_next_event(bot, &ev) == 1) {
+    switch (ev.type) {
+    case DISCORD_EVENT_MESSAGE_CREATE:
+        printf("Message: %s\\n", ev.data.message.content);
+        break;
+    case DISCORD_EVENT_READY:
+        printf("Ready! Session: %s\\n", ev.data.ready.session_id);
+        break;
+    case DISCORD_EVENT_API_RESPONSE:
+        printf("API response: %d (%zu bytes)\\n",
+               ev.data.api_response.status_code,
+               ev.data.api_response.body_len);
+        break;
+    case DISCORD_EVENT_ERROR:
+        fprintf(stderr, "Error: %s\\n", ev.error_msg);
+        break;
+    default: break;
+    }
+}
+.fi
+.SH SEE ALSO
+discord_create(3), discord_feed_input(3), discord_create_message(3), discord_event_t(3)
+.SH NOTES
+Data pointers in events are valid only until the next discord_feed_input or discord_destroy call. The library emits raw JSON for API responses; caller owns all parsing and policy (per ADR 006).

@@ -1,0 +1,52 @@
+.TH DISCORD_CREATE 3 "2026-06-29" "libdiscord 0.1.0" "libdiscord Programmer's Manual"
+.SH NAME
+discord_create, discord_create_with_config, discord_destroy \\\\- Discord context lifecycle (client/server roles, configurable event queue, bot token)
+.SH SYNOPSIS
+.nf
+#include <discord.h>
+
+discord_ctx_t *discord_create(discord_role_t role);
+discord_ctx_t *discord_create_with_config(discord_role_t role, const discord_config_t *config);
+
+void discord_destroy(discord_ctx_t *ctx);
+.fi
+.SH DESCRIPTION
+.B discord_create
+allocates and initializes a Discord context for the given role (DISCORD_ROLE_CLIENT or DISCORD_ROLE_SERVER). Uses default config (event queue size 64, no token).
+
+.B discord_create_with_config
+allows caller-specified configuration via \\\\fBdiscord_config_t\\\\fP:
+.RS
+.IP \\(bu 2
+event_queue_size: depth of the Discord event ring buffer (must be > 0; 0 fails)
+.IP \\(bu 2
+bot_token: Discord bot token string (copied internally; NULL if not needed)
+.IP \\(bu 2
+gateway_url: Gateway WebSocket URL override (NULL = default wss://gateway.discord.gg)
+.IP \\(bu 2
+api_base_url: API base URL override (NULL = default https://discord.com/api/v10)
+.RE
+
+Returns NULL if config is invalid or any allocation fails. Internally owns a rest_ctx_t from librest for HTTP/2 REST and WebSocket transport.
+
+.B discord_destroy
+frees the context, its event queue, API response buffer, and the underlying rest_ctx_t. Safe to call with NULL.
+.SH RETURN VALUES
+create* return a valid ctx pointer or NULL on failure. Caller must check before use.
+.SH EXAMPLES
+.nf
+discord_config_t cfg = {
+    .event_queue_size = 64,
+    .bot_token = "MTIzNDU2Nzg5MDEyMzQ1Njc4OQ.abc123.xyz789"
+};
+discord_ctx_t *bot = discord_create_with_config(DISCORD_ROLE_CLIENT, &cfg);
+if (!bot) { /* handle error */ }
+...
+discord_create_message(bot, "123456789", "Hello!");
+...
+discord_destroy(bot);
+.fi
+.SH SEE ALSO
+discord_next_event(3), discord_feed_input(3), discord_create_message(3), libdiscord(3)
+.SH NOTES
+Contexts are opaque. Use only through the documented API. The context owns its underlying librest rest_ctx_t; no separate lifecycle management needed.
