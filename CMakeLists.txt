@@ -58,6 +58,11 @@ add_executable(discord_dialectic_test tests/test_discord_dialectic.c)
 target_link_libraries(discord_dialectic_test PRIVATE discord)
 add_test(NAME discord_dialectic COMMAND discord_dialectic_test)
 
+# Gateway lifecycle test (synthetic Gateway JSON through feed_input)
+add_executable(discord_gateway_lifecycle_test tests/test_discord_gateway_lifecycle.c)
+target_link_libraries(discord_gateway_lifecycle_test PRIVATE discord)
+add_test(NAME discord_gateway_lifecycle COMMAND discord_gateway_lifecycle_test)
+
 # Fuzz harness (optional — requires -fsanitize=fuzzer)
 # Build with: cmake -B build -S . -DENABLE_FUZZ=ON && cmake --build build
 option(ENABLE_FUZZ "Build fuzz harness (requires libFuzzer)" OFF)
@@ -72,3 +77,23 @@ endif()
 add_executable(discord_bot_example examples/discord_bot_example.c)
 target_link_libraries(discord_bot_example PRIVATE discord)
 target_include_directories(discord_bot_example PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+# Valgrind integration (ADR 003: all tests must pass under Valgrind)
+find_program(VALGRIND_EXECUTABLE valgrind)
+if(VALGRIND_EXECUTABLE)
+    message(STATUS "Found Valgrind: ${VALGRIND_EXECUTABLE}")
+    option(ENABLE_VALGRIND "Run tests under Valgrind with leak checking" OFF)
+    if(ENABLE_VALGRIND)
+        add_test(NAME discord_smoke_valgrind
+            COMMAND ${VALGRIND_EXECUTABLE} --leak-check=full --error-exitcode=1
+                    $<TARGET_FILE:discord_smoke_test>)
+        add_test(NAME discord_dialectic_valgrind
+            COMMAND ${VALGRIND_EXECUTABLE} --leak-check=full --error-exitcode=1
+                    $<TARGET_FILE:discord_dialectic_test>)
+        add_test(NAME discord_gateway_lifecycle_valgrind
+            COMMAND ${VALGRIND_EXECUTABLE} --leak-check=full --error-exitcode=1
+                    $<TARGET_FILE:discord_gateway_lifecycle_test>)
+    endif()
+else()
+    message(STATUS "Valgrind not found; Valgrind tests disabled.")
+endif()

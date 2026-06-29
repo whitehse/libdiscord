@@ -6,6 +6,7 @@
 #include "discord.h"
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h> /* strcasecmp for case-insensitive header comparison */
 #include <stdio.h>  /* snprintf for JSON building */
 #include <stdint.h>
 #include <stdarg.h> /* va_list for build_api_path */
@@ -13,14 +14,12 @@
 #include <rest.h>  /* librest public API for HTTP/2 REST and WebSocket */
 
 #define DISCORD_DEFAULT_EVENT_QUEUE_SIZE 64
-#define DISCORD_MAX_URL_LEN 512
 #define DISCORD_MAX_TOKEN_LEN 512
-#define DISCORD_MAX_SESSION_ID_LEN 128
 #define DISCORD_MAX_JSON_BODY 4096
 #define DISCORD_MAX_AUTH_HEADER 600
+#define DISCORD_MAX_PATH 256
 
 static const char *DISCORD_API_BASE = "https://discord.com/api/v10";
-/* Gateway URL used by discord_gateway_connect (default from librest) */
 
 /* Internal Gateway state */
 typedef enum {
@@ -47,14 +46,22 @@ struct discord_ctx {
     gateway_state_t  gateway_state;
     int              heartbeat_interval_ms;
     int              last_sequence;
-    char             session_id[DISCORD_MAX_SESSION_ID_LEN];
-    char             resume_gateway_url[DISCORD_MAX_URL_LEN];
+    char             session_id[DISCORD_SESSION_ID_LEN];
+    char             resume_gateway_url[DISCORD_URL_LEN];
+    uint64_t         last_heartbeat_ms;  /* monotonic tick of last heartbeat send */
     /* API base URL */
-    char             api_base[DISCORD_MAX_URL_LEN];
+    char             api_base[DISCORD_URL_LEN];
     /* Accumulated API response body */
     char            *api_response_buf;
     size_t           api_response_len;
     size_t           api_response_cap;
+    int              pending_status_code; /* status from RESPONSE_HEADERS */
+    /* Rate limit tracking (accumulated from REST_EVENT_HEADER_PROVIDED) */
+    int              pending_retry_after_ms; /* Retry-After * 1000 */
+    int              pending_ratelimit_remaining; /* X-RateLimit-Remaining */
+    int              pending_ratelimit_reset_after_ms; /* X-RateLimit-Reset-After * 1000 */
+    int              pending_ratelimit_global; /* 1 if global rate limit */
+    char             pending_ratelimit_bucket[DISCORD_ID_LEN]; /* X-RateLimit-Bucket */
     /* librest context (owns HTTP/2 transport) */
     rest_ctx_t      *rest;
 };
@@ -67,15 +74,27 @@ static void accumulate_api_response(discord_ctx_t *ctx, const uint8_t *data, siz
 static void emit_api_response(discord_ctx_t *ctx);
 static void translate_rest_event(discord_ctx_t *ctx, const rest_event_t *rev);
 static void translate_ws_text(discord_ctx_t *ctx, const char *text, size_t len);
+static int json_find_string(const char *json, size_t json_len,
+                            const char *key, char *val_buf, size_t val_max);
+static int json_find_int(const char *json, size_t json_len, const char *key, int *out);
+static const char *json_find_object(const char *json, size_t json_len,
+                                    const char *key, size_t *obj_len);
+static int rest_helper_with_auth(discord_ctx_t *ctx, rest_header_t *headers,
+                                 size_t *num_headers);
 
-/* Lifecycle */
+/* ═══════════════════════════════════════════════════════════════════════
+ * Lifecycle
+ * ═══════════════════════════════════════════════════════════════════════ */
 
 discord_ctx_t *discord_create(discord_role_t role) {
     discord_config_t default_config = {
         .event_queue_size = DISCORD_DEFAULT_EVENT_QUEUE_SIZE,
         .bot_token = NULL,
         .gateway_url = NULL,
-        .api_base_url = NULL
+        .api_base_url = NULL,
+        .intents = 0,
+        .shard_id = 0,
+        .num_shards = 0
     };
     return discord_create_with_config(role, &default_config);
 }
@@ -106,7 +125,7 @@ discord_ctx_t *discord_create_with_config(discord_role_t role, const discord_con
     /* API base URL */
     if (config->api_base_url) {
         size_t blen = strlen(config->api_base_url);
-        if (blen >= DISCORD_MAX_URL_LEN) blen = DISCORD_MAX_URL_LEN - 1;
+        if (blen >= DISCORD_URL_LEN) blen = DISCORD_URL_LEN - 1;
         memcpy(ctx->api_base, config->api_base_url, blen);
         ctx->api_base[blen] = '\0';
     } else {
@@ -123,6 +142,7 @@ discord_ctx_t *discord_create_with_config(discord_role_t role, const discord_con
     ctx->api_response_buf = (char *)malloc(ctx->api_response_cap);
     if (!ctx->api_response_buf) { discord_destroy(ctx); return NULL; }
     ctx->api_response_len = 0;
+    ctx->pending_status_code = 0;
 
     /* Create librest context */
     rest_config_t rest_cfg = {
@@ -147,7 +167,51 @@ void discord_destroy(discord_ctx_t *ctx) {
     free(ctx);
 }
 
-/* Core I/O */
+void discord_reset(discord_ctx_t *ctx) {
+    if (!ctx) return;
+    /* Clear event queue */
+    ctx->queue_head = 0;
+    ctx->queue_tail = 0;
+    /* Reset gateway state */
+    ctx->gateway_state = GATEWAY_STATE_DISCONNECTED;
+    ctx->session_id[0] = '\0';
+    ctx->resume_gateway_url[0] = '\0';
+    ctx->last_sequence = -1;
+    ctx->last_heartbeat_ms = 0;
+    ctx->heartbeat_interval_ms = 41250;
+    /* Clear API response accumulator */
+    ctx->api_response_len = 0;
+    ctx->pending_status_code = 0;
+    /* Clear rate limit tracking */
+    ctx->pending_retry_after_ms = 0;
+    ctx->pending_ratelimit_remaining = -1;
+    ctx->pending_ratelimit_reset_after_ms = 0;
+    ctx->pending_ratelimit_global = 0;
+    ctx->pending_ratelimit_bucket[0] = '\0';
+    /* Reset librest context if present */
+    if (ctx->rest) {
+        rest_destroy(ctx->rest);
+        rest_config_t rest_cfg = {
+            .event_queue_size = ctx->config.event_queue_size,
+            .default_content_type = "application/json"
+        };
+        rest_role_t rest_role = (ctx->role == DISCORD_ROLE_CLIENT) ? REST_ROLE_CLIENT : REST_ROLE_SERVER;
+        ctx->rest = rest_create_with_config(rest_role, &rest_cfg);
+    }
+}
+
+int discord_set_token(discord_ctx_t *ctx, const char *token) {
+    if (!ctx || !token) return -1;
+    size_t tlen = strlen(token);
+    if (tlen >= DISCORD_MAX_TOKEN_LEN) tlen = DISCORD_MAX_TOKEN_LEN - 1;
+    memcpy(ctx->bot_token, token, tlen);
+    ctx->bot_token[tlen] = '\0';
+    return build_auth_header(ctx);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * Core I/O
+ * ═══════════════════════════════════════════════════════════════════════ */
 
 int discord_feed_input(discord_ctx_t *ctx, const uint8_t *data, size_t len) {
     if (!ctx || !data || len == 0) return -1;
@@ -181,29 +245,74 @@ int discord_get_output(discord_ctx_t *ctx, uint8_t *buf, size_t max) {
     return rest_get_output(ctx->rest, buf, max);
 }
 
-/* REST API helpers */
+/* ═══════════════════════════════════════════════════════════════════════
+ * Gateway state accessor
+ * ═══════════════════════════════════════════════════════════════════════ */
 
-int discord_create_message(discord_ctx_t *ctx, const char *channel_id, const char *content) {
-    if (!ctx || !channel_id || !content) return -1;
-    if (!ctx->rest) return -1;
+discord_gateway_state_t discord_gateway_state(discord_ctx_t *ctx) {
+    if (!ctx) return DISCORD_GW_DISCONNECTED;
+    switch (ctx->gateway_state) {
+        case GATEWAY_STATE_CONNECTING:  return DISCORD_GW_CONNECTING;
+        case GATEWAY_STATE_CONNECTED:   return DISCORD_GW_CONNECTED;
+        case GATEWAY_STATE_IDENTIFIED:  return DISCORD_GW_IDENTIFIED;
+        case GATEWAY_STATE_RESUMING:    return DISCORD_GW_RESUMING;
+        default:                        return DISCORD_GW_DISCONNECTED;
+    }
+}
 
-    /* Build path: /channels/{channel_id}/messages */
-    char path[256];
-    if (build_api_path(path, sizeof(path), "/channels/%s/messages", channel_id) < 0) return -1;
+/* ═══════════════════════════════════════════════════════════════════════
+ * REST API helpers
+ * ═══════════════════════════════════════════════════════════════════════ */
 
-    /* Build JSON body: {"content": "..."} */
-    char json[DISCORD_MAX_JSON_BODY];
-    int n = snprintf(json, sizeof(json), "{\"content\":\"%s\"}", content);
-    if (n < 0 || (size_t)n >= sizeof(json)) return -1;
-
-    /* Build headers with auth */
-    rest_header_t headers[1];
-    size_t num_headers = 0;
+/* Helper: populate auth header if available. Returns count (0 or 1). */
+static int rest_helper_with_auth(discord_ctx_t *ctx, rest_header_t *headers,
+                                 size_t *num_headers) {
+    *num_headers = 0;
     if (ctx->auth_header[0]) {
         headers[0].name = "Authorization";
         headers[0].value = ctx->auth_header;
-        num_headers = 1;
+        *num_headers = 1;
     }
+    return 0;
+}
+
+int discord_create_message(discord_ctx_t *ctx, const char *channel_id, const char *content) {
+    return discord_create_message_ex(ctx, channel_id, content, NULL, NULL);
+}
+
+int discord_create_message_ex(discord_ctx_t *ctx, const char *channel_id,
+                              const char *content, const char *embeds_json,
+                              const char *components_json) {
+    if (!ctx || !channel_id) return -1;
+    if (!ctx->rest) return -1;
+
+    char path[DISCORD_MAX_PATH];
+    if (build_api_path(path, sizeof(path), "/channels/%s/messages", channel_id) < 0) return -1;
+
+    /* Build JSON body */
+    char json[DISCORD_MAX_JSON_BODY];
+    int n;
+
+    if (embeds_json && components_json) {
+        n = snprintf(json, sizeof(json),
+            "{\"content\":\"%s\",\"embeds\":%s,\"components\":%s}",
+            content ? content : "", embeds_json, components_json);
+    } else if (embeds_json) {
+        n = snprintf(json, sizeof(json),
+            "{\"content\":\"%s\",\"embeds\":%s}",
+            content ? content : "", embeds_json);
+    } else if (components_json) {
+        n = snprintf(json, sizeof(json),
+            "{\"content\":\"%s\",\"components\":%s}",
+            content ? content : "", components_json);
+    } else {
+        n = snprintf(json, sizeof(json), "{\"content\":\"%s\"}", content ? content : "");
+    }
+    if (n < 0 || (size_t)n >= sizeof(json)) return -1;
+
+    rest_header_t headers[1];
+    size_t num_headers;
+    rest_helper_with_auth(ctx, headers, &num_headers);
 
     return rest_post_json(ctx->rest, path, json, headers, num_headers);
 }
@@ -213,23 +322,17 @@ int discord_edit_message(discord_ctx_t *ctx, const char *channel_id,
     if (!ctx || !channel_id || !message_id || !content) return -1;
     if (!ctx->rest) return -1;
 
-    /* Build path: /channels/{channel_id}/messages/{message_id} */
-    char path[256];
-    if (build_api_path(path, sizeof(path), "/channels/%s/messages/%s", channel_id, message_id) < 0) return -1;
+    char path[DISCORD_MAX_PATH];
+    if (build_api_path(path, sizeof(path), "/channels/%s/messages/%s",
+                       channel_id, message_id) < 0) return -1;
 
-    /* Build JSON body */
     char json[DISCORD_MAX_JSON_BODY];
     int n = snprintf(json, sizeof(json), "{\"content\":\"%s\"}", content);
     if (n < 0 || (size_t)n >= sizeof(json)) return -1;
 
-    /* Build headers with auth */
     rest_header_t headers[1];
-    size_t num_headers = 0;
-    if (ctx->auth_header[0]) {
-        headers[0].name = "Authorization";
-        headers[0].value = ctx->auth_header;
-        num_headers = 1;
-    }
+    size_t num_headers;
+    rest_helper_with_auth(ctx, headers, &num_headers);
 
     return rest_put(ctx->rest, path, (const uint8_t *)json, strlen(json),
                     "application/json", headers, num_headers);
@@ -240,18 +343,13 @@ int discord_delete_message(discord_ctx_t *ctx, const char *channel_id,
     if (!ctx || !channel_id || !message_id) return -1;
     if (!ctx->rest) return -1;
 
-    /* Build path: /channels/{channel_id}/messages/{message_id} */
-    char path[256];
-    if (build_api_path(path, sizeof(path), "/channels/%s/messages/%s", channel_id, message_id) < 0) return -1;
+    char path[DISCORD_MAX_PATH];
+    if (build_api_path(path, sizeof(path), "/channels/%s/messages/%s",
+                       channel_id, message_id) < 0) return -1;
 
-    /* Build headers with auth */
     rest_header_t headers[1];
-    size_t num_headers = 0;
-    if (ctx->auth_header[0]) {
-        headers[0].name = "Authorization";
-        headers[0].value = ctx->auth_header;
-        num_headers = 1;
-    }
+    size_t num_headers;
+    rest_helper_with_auth(ctx, headers, &num_headers);
 
     return rest_delete(ctx->rest, path, headers, num_headers);
 }
@@ -260,23 +358,113 @@ int discord_get_channel(discord_ctx_t *ctx, const char *channel_id) {
     if (!ctx || !channel_id) return -1;
     if (!ctx->rest) return -1;
 
-    /* Build path: /channels/{channel_id} */
-    char path[256];
+    char path[DISCORD_MAX_PATH];
     if (build_api_path(path, sizeof(path), "/channels/%s", channel_id) < 0) return -1;
 
-    /* Build headers with auth */
     rest_header_t headers[1];
-    size_t num_headers = 0;
-    if (ctx->auth_header[0]) {
-        headers[0].name = "Authorization";
-        headers[0].value = ctx->auth_header;
-        num_headers = 1;
-    }
+    size_t num_headers;
+    rest_helper_with_auth(ctx, headers, &num_headers);
 
     return rest_get(ctx->rest, path, headers, num_headers);
 }
 
-/* Gateway helpers */
+int discord_get_guild(discord_ctx_t *ctx, const char *guild_id) {
+    if (!ctx || !guild_id) return -1;
+    if (!ctx->rest) return -1;
+
+    char path[DISCORD_MAX_PATH];
+    if (build_api_path(path, sizeof(path), "/guilds/%s", guild_id) < 0) return -1;
+
+    rest_header_t headers[1];
+    size_t num_headers;
+    rest_helper_with_auth(ctx, headers, &num_headers);
+
+    return rest_get(ctx->rest, path, headers, num_headers);
+}
+
+int discord_get_channel_messages(discord_ctx_t *ctx, const char *channel_id) {
+    if (!ctx || !channel_id) return -1;
+    if (!ctx->rest) return -1;
+
+    char path[DISCORD_MAX_PATH];
+    if (build_api_path(path, sizeof(path), "/channels/%s/messages", channel_id) < 0)
+        return -1;
+
+    rest_header_t headers[1];
+    size_t num_headers;
+    rest_helper_with_auth(ctx, headers, &num_headers);
+
+    return rest_get(ctx->rest, path, headers, num_headers);
+}
+
+int discord_add_reaction(discord_ctx_t *ctx, const char *channel_id,
+                         const char *message_id, const char *emoji) {
+    if (!ctx || !channel_id || !message_id || !emoji) return -1;
+    if (!ctx->rest) return -1;
+
+    char path[DISCORD_MAX_PATH];
+    if (build_api_path(path, sizeof(path), "/channels/%s/messages/%s/reactions/%s/@me",
+                       channel_id, message_id, emoji) < 0) return -1;
+
+    rest_header_t headers[1];
+    size_t num_headers;
+    rest_helper_with_auth(ctx, headers, &num_headers);
+
+    return rest_put(ctx->rest, path, NULL, 0, "application/json", headers, num_headers);
+}
+
+int discord_delete_own_reaction(discord_ctx_t *ctx, const char *channel_id,
+                                const char *message_id, const char *emoji) {
+    if (!ctx || !channel_id || !message_id || !emoji) return -1;
+    if (!ctx->rest) return -1;
+
+    char path[DISCORD_MAX_PATH];
+    if (build_api_path(path, sizeof(path), "/channels/%s/messages/%s/reactions/%s/@me",
+                       channel_id, message_id, emoji) < 0) return -1;
+
+    rest_header_t headers[1];
+    size_t num_headers;
+    rest_helper_with_auth(ctx, headers, &num_headers);
+
+    return rest_delete(ctx->rest, path, headers, num_headers);
+}
+
+int discord_create_interaction_response(discord_ctx_t *ctx,
+                                        const char *interaction_id,
+                                        const char *interaction_token,
+                                        const char *json) {
+    if (!ctx || !interaction_id || !interaction_token || !json) return -1;
+    if (!ctx->rest) return -1;
+
+    char path[DISCORD_MAX_PATH];
+    if (build_api_path(path, sizeof(path), "/interactions/%s/%s/callback",
+                       interaction_id, interaction_token) < 0) return -1;
+
+    rest_header_t headers[1];
+    size_t num_headers;
+    rest_helper_with_auth(ctx, headers, &num_headers);
+
+    return rest_post_json(ctx->rest, path, json, headers, num_headers);
+}
+
+int discord_create_dm(discord_ctx_t *ctx, const char *recipient_id) {
+    if (!ctx || !recipient_id) return -1;
+    if (!ctx->rest) return -1;
+
+    char json[DISCORD_MAX_JSON_BODY];
+    int n = snprintf(json, sizeof(json), "{\"recipient_id\":\"%s\"}", recipient_id);
+    if (n < 0 || (size_t)n >= sizeof(json)) return -1;
+
+    rest_header_t headers[1];
+    size_t num_headers;
+    rest_helper_with_auth(ctx, headers, &num_headers);
+
+    return rest_post_json(ctx->rest, "/users/@me/channels", json, headers, num_headers);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * Gateway helpers
+ * ═══════════════════════════════════════════════════════════════════════ */
 
 int discord_gateway_connect(discord_ctx_t *ctx) {
     if (!ctx) return -1;
@@ -299,34 +487,37 @@ int discord_gateway_send_identify(discord_ctx_t *ctx) {
     if (!ctx->rest) return -1;
     if (!ctx->bot_token[0]) return -1;
 
-    /* Build identify payload:
-     * {
-     *   "op": 2,
-     *   "d": {
-     *     "token": "...",
-     *     "intents": 32767,
-     *     "properties": {"os": "linux", "browser": "libdiscord", "device": "libdiscord"}
-     *   }
-     * }
-     */
+    /* Resolve intents */
+    int intents = ctx->config.intents;
+    if (intents == 0) intents = DISCORD_INTENTS_DEFAULT;
+
+    /* Build identify payload */
     char payload[DISCORD_MAX_JSON_BODY];
-    int n = snprintf(payload, sizeof(payload),
-        "{\"op\":2,\"d\":{\"token\":\"%s\","
-        "\"intents\":32767,"
-        "\"properties\":{\"os\":\"linux\",\"browser\":\"libdiscord\",\"device\":\"libdiscord\"}}}",
-        ctx->bot_token);
+    int n;
+
+    if (ctx->config.num_shards > 0) {
+        n = snprintf(payload, sizeof(payload),
+            "{\"op\":2,\"d\":{\"token\":\"%s\","
+            "\"intents\":%d,"
+            "\"shard\":[%d,%d],"
+            "\"properties\":{\"os\":\"linux\",\"browser\":\"libdiscord\",\"device\":\"libdiscord\"}}}",
+            ctx->bot_token, intents, ctx->config.shard_id, ctx->config.num_shards);
+    } else {
+        n = snprintf(payload, sizeof(payload),
+            "{\"op\":2,\"d\":{\"token\":\"%s\","
+            "\"intents\":%d,"
+            "\"properties\":{\"os\":\"linux\",\"browser\":\"libdiscord\",\"device\":\"libdiscord\"}}}",
+            ctx->bot_token, intents);
+    }
     if (n < 0 || (size_t)n >= sizeof(payload)) return -1;
 
     return rest_ws_send_text(ctx->rest, payload);
 }
 
-int discord_gateway_send_heartbeat(discord_ctx_t *ctx, int last_sequence) {
+int discord_gateway_send_heartbeat(discord_ctx_t *ctx, int last_sequence, uint64_t now_ms) {
     if (!ctx) return -1;
     if (!ctx->rest) return -1;
 
-    /* Build heartbeat payload:
-     * {"op": 1, "d": <last_sequence or null>}
-     */
     char payload[128];
     int n;
     if (last_sequence >= 0) {
@@ -336,6 +527,7 @@ int discord_gateway_send_heartbeat(discord_ctx_t *ctx, int last_sequence) {
     }
     if (n < 0 || (size_t)n >= sizeof(payload)) return -1;
 
+    ctx->last_heartbeat_ms = now_ms;
     return rest_ws_send_text(ctx->rest, payload);
 }
 
@@ -344,9 +536,6 @@ int discord_gateway_send_resume(discord_ctx_t *ctx) {
     if (!ctx->rest) return -1;
     if (!ctx->bot_token[0] || !ctx->session_id[0]) return -1;
 
-    /* Build resume payload:
-     * {"op": 6, "d": {"token": "...", "session_id": "...", "seq": <last_seq>}}
-     */
     char payload[DISCORD_MAX_JSON_BODY];
     int n = snprintf(payload, sizeof(payload),
         "{\"op\":6,\"d\":{\"token\":\"%s\",\"session_id\":\"%s\",\"seq\":%d}}",
@@ -357,15 +546,20 @@ int discord_gateway_send_resume(discord_ctx_t *ctx) {
     return rest_ws_send_text(ctx->rest, payload);
 }
 
-int discord_gateway_process_heartbeat(discord_ctx_t *ctx) {
+int discord_gateway_process_heartbeat(discord_ctx_t *ctx, uint64_t now_ms) {
     if (!ctx) return 0;
-    /* Pure function — caller is responsible for timing.
-     * This always returns 1 to indicate "send heartbeat now".
-     * In a real implementation, the caller tracks the interval. */
-    return 1;
+    /* First heartbeat: send immediately after Hello */
+    if (ctx->last_heartbeat_ms == 0) return 1;
+    /* Check if interval has elapsed */
+    if (now_ms - ctx->last_heartbeat_ms >= (uint64_t)ctx->heartbeat_interval_ms) {
+        return 1;
+    }
+    return 0;
 }
 
-/* Internal helpers */
+/* ═══════════════════════════════════════════════════════════════════════
+ * Internal helpers
+ * ═══════════════════════════════════════════════════════════════════════ */
 
 static int enqueue_event(discord_ctx_t *ctx, const discord_event_t *ev) {
     if (!ctx || !ev) return -1;
@@ -407,52 +601,121 @@ static void accumulate_api_response(discord_ctx_t *ctx, const uint8_t *data, siz
 
 static void emit_api_response(discord_ctx_t *ctx) {
     if (!ctx) return;
-    discord_event_t ev = {0};
+    discord_event_t ev;
+    memset(&ev, 0, sizeof(ev));
     ev.type = DISCORD_EVENT_API_RESPONSE;
-    ev.data.api_response.json_body = ctx->api_response_buf;
-    ev.data.api_response.body_len = ctx->api_response_len;
+    ev.data.api_response.status_code = ctx->pending_status_code;
+    /* Copy body into event's embedded buffer (truncated if needed) */
+    size_t copy_len = ctx->api_response_len;
+    int truncated = 0;
+    if (copy_len >= DISCORD_EV_BODY_CAP) {
+        copy_len = DISCORD_EV_BODY_CAP - 1;
+        truncated = 1;
+    }
+    if (copy_len > 0 && ctx->api_response_buf) {
+        memcpy(ev.data.api_response.json_body, ctx->api_response_buf, copy_len);
+    }
+    ev.data.api_response.json_body[copy_len] = '\0';
+    ev.data.api_response.body_len = copy_len;
+    ev.data.api_response.truncated = truncated;
     (void)enqueue_event(ctx, &ev);
-    /* Reset accumulator (pointer is still valid in event until next feed_input) */
+    /* Reset accumulator */
     ctx->api_response_len = 0;
+    ctx->pending_status_code = 0;
 }
+
+/* Safe string copy into a fixed-size destination buffer */
+static void safe_strcpy(char *dst, size_t dst_size, const char *src) {
+    if (!dst || dst_size == 0) return;
+    if (!src) { dst[0] = '\0'; return; }
+    size_t len = strlen(src);
+    if (len >= dst_size) len = dst_size - 1;
+    memcpy(dst, src, len);
+    dst[len] = '\0';
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * REST event translation
+ * ═══════════════════════════════════════════════════════════════════════ */
 
 static void translate_rest_event(discord_ctx_t *ctx, const rest_event_t *rev) {
     if (!ctx || !rev) return;
 
     switch (rev->type) {
         case REST_EVENT_RESPONSE_HEADERS:
-            /* API response starting — reset accumulator */
+            /* Capture status code for the eventual API_RESPONSE event */
             ctx->api_response_len = 0;
-            /* Extract status code if available */
+            /* Reset rate limit tracking for new response */
+            ctx->pending_retry_after_ms = 0;
+            ctx->pending_ratelimit_remaining = -1;
+            ctx->pending_ratelimit_reset_after_ms = 0;
+            ctx->pending_ratelimit_global = 0;
+            ctx->pending_ratelimit_bucket[0] = '\0';
             if (rev->data.status.status > 0) {
-                /* Will be emitted when response completes */
+                ctx->pending_status_code = rev->data.status.status;
+            }
+            break;
+
+        case REST_EVENT_HEADER_PROVIDED:
+            /* Parse rate limit headers */
+            if (rev->data.header.name && rev->data.header.value) {
+                const char *name = rev->data.header.name;
+                const char *val = rev->data.header.value;
+                if (strcasecmp(name, "retry-after") == 0) {
+                    /* Retry-After is seconds (float); convert to ms */
+                    double secs = atof(val);
+                    ctx->pending_retry_after_ms = (int)(secs * 1000.0);
+                } else if (strcasecmp(name, "x-ratelimit-remaining") == 0) {
+                    ctx->pending_ratelimit_remaining = atoi(val);
+                } else if (strcasecmp(name, "x-ratelimit-reset-after") == 0) {
+                    double secs = atof(val);
+                    ctx->pending_ratelimit_reset_after_ms = (int)(secs * 1000.0);
+                } else if (strcasecmp(name, "x-ratelimit-bucket") == 0) {
+                    safe_strcpy(ctx->pending_ratelimit_bucket,
+                                sizeof(ctx->pending_ratelimit_bucket), val);
+                } else if (strcasecmp(name, "x-ratelimit-global") == 0) {
+                    /* Value is "true" for global limits */
+                    if (strcmp(val, "true") == 0) ctx->pending_ratelimit_global = 1;
+                } else if (strcasecmp(name, "x-ratelimit-scope") == 0) {
+                    /* "global" scope indicates global rate limit */
+                    if (strcmp(val, "global") == 0) ctx->pending_ratelimit_global = 1;
+                }
             }
             break;
 
         case REST_EVENT_RESPONSE_DATA:
-            /* Accumulate response body */
             if (rev->data.data.data && rev->data.data.len > 0) {
                 accumulate_api_response(ctx, rev->data.data.data, rev->data.data.len);
             }
             break;
 
         case REST_EVENT_RESPONSE_COMPLETE:
-            /* Emit complete API response */
             emit_api_response(ctx);
+            /* Emit rate limited event if status is 429 */
+            if (ctx->pending_status_code == 429) {
+                discord_event_t rlev;
+                memset(&rlev, 0, sizeof(rlev));
+                rlev.type = DISCORD_EVENT_RATE_LIMITED;
+                rlev.data.rate_limit.retry_after_ms = ctx->pending_retry_after_ms;
+                rlev.data.rate_limit.is_global = ctx->pending_ratelimit_global;
+                safe_strcpy(rlev.data.rate_limit.bucket,
+                            sizeof(rlev.data.rate_limit.bucket),
+                            ctx->pending_ratelimit_bucket);
+                (void)enqueue_event(ctx, &rlev);
+            }
             break;
 
         case REST_EVENT_BINARY_CHANNEL_READY:
         {
-            /* Gateway or binary channel connected */
             ctx->gateway_state = GATEWAY_STATE_CONNECTED;
-            discord_event_t ev = {0};
+            discord_event_t ev;
+            memset(&ev, 0, sizeof(ev));
             ev.type = DISCORD_EVENT_CONNECTED;
             (void)enqueue_event(ctx, &ev);
             break;
         }
 
         case REST_EVENT_WS_TEXT:
-            /* Gateway message — parse and translate */
             if (rev->data.ws_message.data && rev->data.ws_message.len > 0) {
                 translate_ws_text(ctx, (const char *)rev->data.ws_message.data,
                                   rev->data.ws_message.len);
@@ -461,7 +724,8 @@ static void translate_rest_event(discord_ctx_t *ctx, const rest_event_t *rev) {
 
         case REST_EVENT_WS_BINARY:
         {
-            discord_event_t ev = {0};
+            discord_event_t ev;
+            memset(&ev, 0, sizeof(ev));
             ev.type = DISCORD_EVENT_RAW;
             (void)enqueue_event(ctx, &ev);
             break;
@@ -470,7 +734,8 @@ static void translate_rest_event(discord_ctx_t *ctx, const rest_event_t *rev) {
         case REST_EVENT_WS_CLOSE:
         {
             ctx->gateway_state = GATEWAY_STATE_DISCONNECTED;
-            discord_event_t ev = {0};
+            discord_event_t ev;
+            memset(&ev, 0, sizeof(ev));
             ev.type = DISCORD_EVENT_DISCONNECTED;
             (void)enqueue_event(ctx, &ev);
             break;
@@ -478,28 +743,32 @@ static void translate_rest_event(discord_ctx_t *ctx, const rest_event_t *rev) {
 
         case REST_EVENT_ERROR:
         {
-            discord_event_t ev = {0};
+            discord_event_t ev;
+            memset(&ev, 0, sizeof(ev));
             ev.type = DISCORD_EVENT_ERROR;
-            ev.error_msg = rev->error_msg ? rev->error_msg : "REST error";
+            if (rev->error_msg) {
+                safe_strcpy(ev.error_msg, sizeof(ev.error_msg), rev->error_msg);
+            } else {
+                safe_strcpy(ev.error_msg, sizeof(ev.error_msg), "REST error");
+            }
             (void)enqueue_event(ctx, &ev);
             break;
         }
 
         default:
-            /* Other REST events not directly mapped to Discord events */
             break;
     }
 }
 
-/* Minimal JSON field extraction (no parser, pure string search — plumbing only).
- * Finds "key":"value" or "key":value patterns in a JSON string.
- * Returns 1 if found, 0 otherwise. Value written to val_buf. */
+/* ═══════════════════════════════════════════════════════════════════════
+ * Minimal JSON field extraction (no parser, pure string search)
+ * ═══════════════════════════════════════════════════════════════════════ */
+
 static int json_find_string(const char *json, size_t json_len,
                             const char *key, char *val_buf, size_t val_max) {
     if (!json || !key || !val_buf || val_max == 0) return 0;
     size_t klen = strlen(key);
 
-    /* Search for "key": pattern */
     for (size_t i = 0; i + klen + 3 < json_len; i++) {
         if (json[i] == '"' && memcmp(json + i + 1, key, klen) == 0 &&
             json[i + 1 + klen] == '"') {
@@ -512,11 +781,31 @@ static int json_find_string(const char *json, size_t json_len,
             if (json[pos] == '"') {
                 pos++;
                 size_t start = pos;
-                while (pos < json_len && json[pos] != '"') pos++;
+                while (pos < json_len) {
+                    if (json[pos] == '\\' && pos + 1 < json_len) {
+                        pos += 2; /* skip escaped character */
+                        continue;
+                    }
+                    if (json[pos] == '"') break;
+                    pos++;
+                }
                 size_t vlen = pos - start;
                 if (vlen >= val_max) vlen = val_max - 1;
-                memcpy(val_buf, json + start, vlen);
-                val_buf[vlen] = '\0';
+                /* Copy, unescaping \" and \\ */
+                size_t wi = 0;
+                for (size_t ri = 0; ri < vlen && wi < val_max - 1; ri++) {
+                    if (start + ri < json_len - 1 &&
+                        json[start + ri] == '\\') {
+                        char next = json[start + ri + 1];
+                        if (next == '"' || next == '\\') {
+                            val_buf[wi++] = next;
+                            ri++; /* skip the escaped char */
+                            continue;
+                        }
+                    }
+                    val_buf[wi++] = json[start + ri];
+                }
+                val_buf[wi] = '\0';
                 return 1;
             }
             /* Non-string value (number, null, etc.) */
@@ -572,6 +861,10 @@ static const char *json_find_object(const char *json, size_t json_len,
     return NULL;
 }
 
+/* ═══════════════════════════════════════════════════════════════════════
+ * Gateway WebSocket text → Discord event translation
+ * ═══════════════════════════════════════════════════════════════════════ */
+
 static void translate_ws_text(discord_ctx_t *ctx, const char *text, size_t len) {
     if (!ctx || !text || len == 0) return;
 
@@ -586,32 +879,37 @@ static void translate_ws_text(discord_ctx_t *ctx, const char *text, size_t len) 
     char event_name[64] = {0};
     json_find_string(text, len, "t", event_name, sizeof(event_name));
 
+    /* Temp buffer for JSON extraction */
+    char tmp[DISCORD_EV_BODY_CAP];
+
     switch (op) {
         case 0: /* Dispatch */
             if (strcmp(event_name, "READY") == 0) {
-                /* Extract READY data: user.id, session_id, resume_gateway_url */
                 size_t dlen = 0;
                 const char *d = json_find_object(text, len, "d", &dlen);
                 if (d && dlen > 0) {
-                    /* Session ID */
+                    discord_event_t ev;
+                    memset(&ev, 0, sizeof(ev));
+                    ev.type = DISCORD_EVENT_READY;
+
                     json_find_string(d, dlen, "session_id",
-                                     ctx->session_id, sizeof(ctx->session_id));
-                    /* Resume gateway URL */
+                                     ev.data.ready.session_id, sizeof(ev.data.ready.session_id));
+                    /* Cache session_id for resume */
+                    safe_strcpy(ctx->session_id, sizeof(ctx->session_id),
+                                ev.data.ready.session_id);
+
                     json_find_string(d, dlen, "resume_gateway_url",
-                                     ctx->resume_gateway_url, sizeof(ctx->resume_gateway_url));
-                    /* User ID — nested in "user": {"id": "..."} */
+                                     ev.data.ready.gateway_url, sizeof(ev.data.ready.gateway_url));
+                    safe_strcpy(ctx->resume_gateway_url, sizeof(ctx->resume_gateway_url),
+                                ev.data.ready.gateway_url);
+
                     size_t ulen = 0;
                     const char *uobj = json_find_object(d, dlen, "user", &ulen);
-                    char uid[64] = {0};
                     if (uobj && ulen > 0) {
-                        json_find_string(uobj, ulen, "id", uid, sizeof(uid));
+                        json_find_string(uobj, ulen, "id",
+                                         ev.data.ready.user_id, sizeof(ev.data.ready.user_id));
                     }
 
-                    discord_event_t ev = {0};
-                    ev.type = DISCORD_EVENT_READY;
-                    ev.data.ready.user_id = ctx->session_id[0] ? uid : NULL;
-                    ev.data.ready.session_id = ctx->session_id[0] ? ctx->session_id : NULL;
-                    ev.data.ready.gateway_url = ctx->resume_gateway_url[0] ? ctx->resume_gateway_url : NULL;
                     ctx->gateway_state = GATEWAY_STATE_IDENTIFIED;
                     (void)enqueue_event(ctx, &ev);
                 }
@@ -619,51 +917,187 @@ static void translate_ws_text(discord_ctx_t *ctx, const char *text, size_t len) 
                 size_t dlen = 0;
                 const char *d = json_find_object(text, len, "d", &dlen);
                 if (d && dlen > 0) {
-                    /* Store raw JSON in event (caller owns parsing) */
-                    discord_event_t ev = {0};
+                    discord_event_t ev;
+                    memset(&ev, 0, sizeof(ev));
                     ev.type = DISCORD_EVENT_MESSAGE_CREATE;
-                    /* Minimal field extraction for convenience */
-                    static char msg_id[64], ch_id[64], guild_id[64], author_id[64];
-                    static char content[2048], timestamp[64];
-                    json_find_string(d, dlen, "id", msg_id, sizeof(msg_id));
-                    json_find_string(d, dlen, "channel_id", ch_id, sizeof(ch_id));
-                    json_find_string(d, dlen, "guild_id", guild_id, sizeof(guild_id));
-                    json_find_string(d, dlen, "content", content, sizeof(content));
-                    json_find_string(d, dlen, "timestamp", timestamp, sizeof(timestamp));
+
+                    json_find_string(d, dlen, "id",
+                        ev.data.message.id, sizeof(ev.data.message.id));
+                    json_find_string(d, dlen, "channel_id",
+                        ev.data.message.channel_id, sizeof(ev.data.message.channel_id));
+                    json_find_string(d, dlen, "guild_id",
+                        ev.data.message.guild_id, sizeof(ev.data.message.guild_id));
+                    json_find_string(d, dlen, "content",
+                        ev.data.message.content, sizeof(ev.data.message.content));
+                    json_find_string(d, dlen, "timestamp",
+                        ev.data.message.timestamp, sizeof(ev.data.message.timestamp));
+
                     size_t alen = 0;
                     const char *aobj = json_find_object(d, dlen, "author", &alen);
                     if (aobj && alen > 0) {
-                        json_find_string(aobj, alen, "id", author_id, sizeof(author_id));
+                        json_find_string(aobj, alen, "id",
+                            ev.data.message.author_id, sizeof(ev.data.message.author_id));
                     }
-                    ev.data.message.id = msg_id;
-                    ev.data.message.channel_id = ch_id;
-                    ev.data.message.guild_id = guild_id[0] ? guild_id : NULL;
-                    ev.data.message.author_id = author_id[0] ? author_id : NULL;
-                    ev.data.message.content = content[0] ? content : NULL;
-                    ev.data.message.timestamp = timestamp[0] ? timestamp : NULL;
+
                     (void)enqueue_event(ctx, &ev);
                 }
             } else if (strcmp(event_name, "MESSAGE_UPDATE") == 0) {
-                discord_event_t ev = {0};
-                ev.type = DISCORD_EVENT_MESSAGE_UPDATE;
-                (void)enqueue_event(ctx, &ev);
+                size_t dlen = 0;
+                const char *d = json_find_object(text, len, "d", &dlen);
+                if (d && dlen > 0) {
+                    discord_event_t ev;
+                    memset(&ev, 0, sizeof(ev));
+                    ev.type = DISCORD_EVENT_MESSAGE_UPDATE;
+                    json_find_string(d, dlen, "id",
+                        ev.data.message.id, sizeof(ev.data.message.id));
+                    json_find_string(d, dlen, "channel_id",
+                        ev.data.message.channel_id, sizeof(ev.data.message.channel_id));
+                    json_find_string(d, dlen, "content",
+                        ev.data.message.content, sizeof(ev.data.message.content));
+                    (void)enqueue_event(ctx, &ev);
+                }
             } else if (strcmp(event_name, "MESSAGE_DELETE") == 0) {
-                discord_event_t ev = {0};
-                ev.type = DISCORD_EVENT_MESSAGE_DELETE;
+                size_t dlen = 0;
+                const char *d = json_find_object(text, len, "d", &dlen);
+                if (d && dlen > 0) {
+                    discord_event_t ev;
+                    memset(&ev, 0, sizeof(ev));
+                    ev.type = DISCORD_EVENT_MESSAGE_DELETE;
+                    json_find_string(d, dlen, "id",
+                        ev.data.message.id, sizeof(ev.data.message.id));
+                    json_find_string(d, dlen, "channel_id",
+                        ev.data.message.channel_id, sizeof(ev.data.message.channel_id));
+                    (void)enqueue_event(ctx, &ev);
+                }
+            } else if (strcmp(event_name, "CHANNEL_CREATE") == 0 ||
+                       strcmp(event_name, "CHANNEL_UPDATE") == 0 ||
+                       strcmp(event_name, "CHANNEL_DELETE") == 0) {
+                discord_event_type_t etype = DISCORD_EVENT_CHANNEL_CREATE;
+                if (event_name[8] == 'U') etype = DISCORD_EVENT_CHANNEL_UPDATE;
+                else if (event_name[8] == 'D') etype = DISCORD_EVENT_CHANNEL_DELETE;
+                discord_event_t ev;
+                memset(&ev, 0, sizeof(ev));
+                ev.type = etype;
                 (void)enqueue_event(ctx, &ev);
             } else if (strcmp(event_name, "GUILD_CREATE") == 0) {
-                discord_event_t ev = {0};
+                discord_event_t ev;
+                memset(&ev, 0, sizeof(ev));
                 ev.type = DISCORD_EVENT_GUILD_CREATE;
                 (void)enqueue_event(ctx, &ev);
-            } else if (strcmp(event_name, "INTERACTION_CREATE") == 0) {
-                discord_event_t ev = {0};
-                ev.type = DISCORD_EVENT_INTERACTION_CREATE;
+            } else if (strcmp(event_name, "GUILD_UPDATE") == 0) {
+                discord_event_t ev;
+                memset(&ev, 0, sizeof(ev));
+                ev.type = DISCORD_EVENT_GUILD_UPDATE;
                 (void)enqueue_event(ctx, &ev);
+            } else if (strcmp(event_name, "GUILD_DELETE") == 0) {
+                discord_event_t ev;
+                memset(&ev, 0, sizeof(ev));
+                ev.type = DISCORD_EVENT_GUILD_DELETE;
+                (void)enqueue_event(ctx, &ev);
+            } else if (strcmp(event_name, "GUILD_MEMBER_ADD") == 0 ||
+                       strcmp(event_name, "GUILD_MEMBER_REMOVE") == 0 ||
+                       strcmp(event_name, "GUILD_MEMBER_UPDATE") == 0) {
+                discord_event_type_t etype = DISCORD_EVENT_GUILD_MEMBER_ADD;
+                if (event_name[13] == 'R') etype = DISCORD_EVENT_GUILD_MEMBER_REMOVE;
+                else if (event_name[13] == 'U') etype = DISCORD_EVENT_GUILD_MEMBER_UPDATE;
+                discord_event_t ev;
+                memset(&ev, 0, sizeof(ev));
+                ev.type = etype;
+                (void)enqueue_event(ctx, &ev);
+            } else if (strcmp(event_name, "GUILD_ROLE_CREATE") == 0 ||
+                       strcmp(event_name, "GUILD_ROLE_UPDATE") == 0 ||
+                       strcmp(event_name, "GUILD_ROLE_DELETE") == 0) {
+                discord_event_type_t etype = DISCORD_EVENT_GUILD_ROLE_CREATE;
+                if (event_name[11] == 'U') etype = DISCORD_EVENT_GUILD_ROLE_UPDATE;
+                else if (event_name[11] == 'D') etype = DISCORD_EVENT_GUILD_ROLE_DELETE;
+                discord_event_t ev;
+                memset(&ev, 0, sizeof(ev));
+                ev.type = etype;
+                (void)enqueue_event(ctx, &ev);
+            } else if (strcmp(event_name, "MESSAGE_REACTION_ADD") == 0) {
+                discord_event_t ev;
+                memset(&ev, 0, sizeof(ev));
+                ev.type = DISCORD_EVENT_MESSAGE_REACTION_ADD;
+                (void)enqueue_event(ctx, &ev);
+            } else if (strcmp(event_name, "MESSAGE_REACTION_REMOVE") == 0) {
+                discord_event_t ev;
+                memset(&ev, 0, sizeof(ev));
+                ev.type = DISCORD_EVENT_MESSAGE_REACTION_REMOVE;
+                (void)enqueue_event(ctx, &ev);
+            } else if (strcmp(event_name, "PRESENCE_UPDATE") == 0) {
+                discord_event_t ev;
+                memset(&ev, 0, sizeof(ev));
+                ev.type = DISCORD_EVENT_PRESENCE_UPDATE;
+                (void)enqueue_event(ctx, &ev);
+            } else if (strcmp(event_name, "TYPING_START") == 0) {
+                discord_event_t ev;
+                memset(&ev, 0, sizeof(ev));
+                ev.type = DISCORD_EVENT_TYPING_START;
+                (void)enqueue_event(ctx, &ev);
+            } else if (strcmp(event_name, "VOICE_STATE_UPDATE") == 0) {
+                discord_event_t ev;
+                memset(&ev, 0, sizeof(ev));
+                ev.type = DISCORD_EVENT_VOICE_STATE_UPDATE;
+                (void)enqueue_event(ctx, &ev);
+            } else if (strcmp(event_name, "THREAD_CREATE") == 0 ||
+                       strcmp(event_name, "THREAD_UPDATE") == 0 ||
+                       strcmp(event_name, "THREAD_DELETE") == 0) {
+                discord_event_type_t etype = DISCORD_EVENT_THREAD_CREATE;
+                if (event_name[7] == 'U') etype = DISCORD_EVENT_THREAD_UPDATE;
+                else if (event_name[7] == 'D') etype = DISCORD_EVENT_THREAD_DELETE;
+                discord_event_t ev;
+                memset(&ev, 0, sizeof(ev));
+                ev.type = etype;
+                (void)enqueue_event(ctx, &ev);
+            } else if (strcmp(event_name, "INTERACTION_CREATE") == 0) {
+                size_t dlen = 0;
+                const char *d = json_find_object(text, len, "d", &dlen);
+                if (d && dlen > 0) {
+                    discord_event_t ev;
+                    memset(&ev, 0, sizeof(ev));
+                    ev.type = DISCORD_EVENT_INTERACTION_CREATE;
+
+                    json_find_string(d, dlen, "id",
+                        ev.data.interaction.id, sizeof(ev.data.interaction.id));
+                    json_find_string(d, dlen, "token",
+                        ev.data.interaction.token, sizeof(ev.data.interaction.token));
+                    json_find_string(d, dlen, "application_id",
+                        ev.data.interaction.application_id,
+                        sizeof(ev.data.interaction.application_id));
+                    ev.data.interaction.type = 0;
+                    json_find_int(d, dlen, "type", &ev.data.interaction.type);
+
+                    /* Copy raw data field as JSON */
+                    size_t ddlen = 0;
+                    const char *dd = json_find_object(d, dlen, "data", &ddlen);
+                    if (dd && ddlen > 0) {
+                        if (ddlen >= DISCORD_EV_BODY_CAP) ddlen = DISCORD_EV_BODY_CAP - 1;
+                        memcpy(ev.data.interaction.data_json, dd, ddlen);
+                        ev.data.interaction.data_json[ddlen] = '\0';
+                    }
+
+                    (void)enqueue_event(ctx, &ev);
+                }
             }
             break;
 
-        case 7: /* Resume required */
-            /* Caller should reconnect and send resume */
+        case 1: /* Heartbeat request from server */
+        {
+            discord_event_t ev;
+            memset(&ev, 0, sizeof(ev));
+            ev.type = DISCORD_EVENT_HEARTBEAT_REQUEST;
+            (void)enqueue_event(ctx, &ev);
+            break;
+        }
+
+        case 7: /* Reconnect — server requests client reconnect */
+            ctx->gateway_state = GATEWAY_STATE_DISCONNECTED;
+            {
+                discord_event_t ev;
+                memset(&ev, 0, sizeof(ev));
+                ev.type = DISCORD_EVENT_RECONNECT_REQUEST;
+                (void)enqueue_event(ctx, &ev);
+            }
             break;
 
         case 9: /* Invalid session */
@@ -681,17 +1115,23 @@ static void translate_ws_text(discord_ctx_t *ctx, const char *text, size_t len) 
                     ctx->heartbeat_interval_ms = interval;
                 }
             }
-            /* After Hello, send identify */
             ctx->gateway_state = GATEWAY_STATE_CONNECTED;
             break;
         }
 
         case 11: /* Heartbeat ACK */
-            /* Nothing to emit — caller tracks acks */
+        {
+            discord_event_t ev;
+            memset(&ev, 0, sizeof(ev));
+            ev.type = DISCORD_EVENT_HEARTBEAT_ACK;
+            (void)enqueue_event(ctx, &ev);
             break;
+        }
 
         default:
-            /* Unknown op — emit raw */
             break;
     }
+
+    /* Suppress unused variable warning */
+    (void)tmp;
 }

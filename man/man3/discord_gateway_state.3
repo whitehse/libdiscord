@@ -1,0 +1,65 @@
+.TH DISCORD_GATEWAY_STATE 3 "2026-06-29" "libdiscord 0.2.0" "libdiscord Programmer's Manual"
+.SH NAME
+discord_gateway_state \\\\- query current Gateway connection state
+.SH SYNOPSIS
+.nf
+#include <discord.h>
+
+discord_gateway_state_t discord_gateway_state(discord_ctx_t *ctx);
+.fi
+.SH DESCRIPTION
+.B discord_gateway_state
+returns the current Gateway connection state as a
+.B discord_gateway_state_t
+enum value. This is a read-only accessor with no side effects.
+
+Possible states:
+.TP
+.B DISCORD_GW_DISCONNECTED
+Initial state, or after disconnect/reconnect-request/reset.
+.TP
+.B DISCORD_GW_CONNECTING
+.BR discord_gateway_connect (3)
+called, waiting for binary channel.
+.TP
+.B DISCORD_GW_CONNECTED
+Binary channel established (or Hello received).
+.TP
+.B DISCORD_GW_IDENTIFIED
+Gateway READY received (session established).
+.TP
+.B DISCORD_GW_RESUMING
+.BR discord_gateway_send_resume (3)
+called, waiting for resumed event stream.
+.SH RETURN VALUES
+Current
+.B discord_gateway_state_t
+value. Returns DISCORD_GW_DISCONNECTED if ctx is NULL.
+.SH EXAMPLES
+.nf
+discord_gateway_state_t state = discord_gateway_state(bot);
+switch (state) {
+case DISCORD_GW_DISCONNECTED:
+    printf("Not connected\\n");
+    break;
+case DISCORD_GW_CONNECTING:
+    printf("Connecting...\\n");
+    break;
+case DISCORD_GW_CONNECTED:
+    printf("Connected, sending identify\\n");
+    break;
+case DISCORD_GW_IDENTIFIED:
+    printf("Ready and identified\\n");
+    break;
+case DISCORD_GW_RESUMING:
+    printf("Resuming session...\\n");
+    break;
+}
+.fi
+.SH SEE ALSO
+discord_gateway_connect(3), discord_gateway_send_identify(3), discord_gateway_send_resume(3), discord_reset(3)
+.SH NOTES
+The state is updated internally based on REST and Gateway events processed during
+.BR discord_feed_input (3).
+State transitions are:
+DISCONNECTED → CONNECTING → CONNECTED → IDENTIFIED (or RESUMING → CONNECTED → IDENTIFIED).

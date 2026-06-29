@@ -1,0 +1,38 @@
+.TH DISCORD_GATEWAY_PROCESS_HEARTBEAT 3 "2026-06-29" "libdiscord 0.2.0" "libdiscord Programmer's Manual"
+.SH NAME
+discord_gateway_process_heartbeat \\\\- check if a Gateway heartbeat should be sent now
+.SH SYNOPSIS
+.nf
+#include <discord.h>
+
+int discord_gateway_process_heartbeat(discord_ctx_t *ctx, uint64_t now_ms);
+.fi
+.SH DESCRIPTION
+.B discord_gateway_process_heartbeat
+is a timing helper that the caller invokes periodically with the current monotonic timestamp. It returns 1 if a heartbeat should be sent now, 0 otherwise.
+
+The logic:
+.IP \(bu 2
+If no heartbeat has ever been sent (last_heartbeat_ms == 0), returns 1 immediately — the first heartbeat should be sent right after receiving the Gateway Hello (op 10).
+.IP \(bu 2
+If (now_ms - last_heartbeat_ms) >= heartbeat_interval_ms, returns 1 — the interval has elapsed.
+.IP \(bu 2
+Otherwise returns 0 — not yet time.
+
+The heartbeat interval is captured from the Gateway Hello payload (typically ~41.25 seconds). This function performs no I/O and generates no output — it only checks timing.
+.SH RETURN VALUES
+1 if a heartbeat should be sent now, 0 otherwise. Returns 0 if ctx is NULL.
+.SH EXAMPLES
+.nf
+/* In the application's main loop: */
+uint64_t now = get_monotonic_ms();
+
+if (discord_gateway_process_heartbeat(bot, now)) {
+    discord_gateway_send_heartbeat(bot, last_seq, now);
+    /* ... extract and send output frames ... */
+}
+.fi
+.SH SEE ALSO
+discord_gateway_send_heartbeat(3), discord_gateway_connect(3), discord_gateway_send_identify(3)
+.SH NOTES
+The caller must supply a monotonic millisecond timestamp. Wall-clock time is not suitable due to NTP adjustments and daylight saving transitions. The library does not perform any timing internally — the caller drives the heartbeat loop.

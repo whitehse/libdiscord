@@ -24,8 +24,8 @@ static void print_event(const discord_event_t *ev) {
     switch (ev->type) {
         case DISCORD_EVENT_READY:
             printf("  Event: READY user_id=%s session_id=%s\n",
-                   ev->data.ready.user_id ? ev->data.ready.user_id : "?",
-                   ev->data.ready.session_id ? ev->data.ready.session_id : "?");
+                   ev->data.ready.user_id[0] ? ev->data.ready.user_id : "?",
+                   ev->data.ready.session_id[0] ? ev->data.ready.session_id : "?");
             break;
         case DISCORD_EVENT_CONNECTED:
             printf("  Event: CONNECTED (binary channel established)\n");
@@ -33,17 +33,27 @@ static void print_event(const discord_event_t *ev) {
         case DISCORD_EVENT_DISCONNECTED:
             printf("  Event: DISCONNECTED\n");
             break;
+        case DISCORD_EVENT_HEARTBEAT_REQUEST:
+            printf("  Event: HEARTBEAT_REQUEST — send heartbeat now\n");
+            break;
+        case DISCORD_EVENT_HEARTBEAT_ACK:
+            printf("  Event: HEARTBEAT_ACK — server confirmed heartbeat\n");
+            break;
+        case DISCORD_EVENT_RECONNECT_REQUEST:
+            printf("  Event: RECONNECT_REQUEST — server asks us to reconnect\n");
+            break;
         case DISCORD_EVENT_MESSAGE_CREATE:
             printf("  Event: MESSAGE_CREATE id=%s channel=%s content=%s\n",
-                   ev->data.message.id ? ev->data.message.id : "?",
-                   ev->data.message.channel_id ? ev->data.message.channel_id : "?",
-                   ev->data.message.content ? ev->data.message.content : "");
+                   ev->data.message.id[0] ? ev->data.message.id : "?",
+                   ev->data.message.channel_id[0] ? ev->data.message.channel_id : "?",
+                   ev->data.message.content[0] ? ev->data.message.content : "");
             break;
         case DISCORD_EVENT_API_RESPONSE:
-            printf("  Event: API_RESPONSE status=%d body_len=%zu\n",
+            printf("  Event: API_RESPONSE status=%d body_len=%zu%s\n",
                    ev->data.api_response.status_code,
-                   ev->data.api_response.body_len);
-            if (ev->data.api_response.json_body && ev->data.api_response.body_len > 0) {
+                   ev->data.api_response.body_len,
+                   ev->data.api_response.truncated ? " (truncated)" : "");
+            if (ev->data.api_response.json_body[0] && ev->data.api_response.body_len > 0) {
                 printf("  Body: %.*s\n", (int)ev->data.api_response.body_len,
                        ev->data.api_response.json_body);
             }
@@ -52,11 +62,19 @@ static void print_event(const discord_event_t *ev) {
             printf("  Event: GUILD_CREATE\n");
             break;
         case DISCORD_EVENT_INTERACTION_CREATE:
-            printf("  Event: INTERACTION_CREATE\n");
+            printf("  Event: INTERACTION_CREATE id=%s type=%d\n",
+                   ev->data.interaction.id[0] ? ev->data.interaction.id : "?",
+                   ev->data.interaction.type);
+            break;
+        case DISCORD_EVENT_CHANNEL_CREATE:
+            printf("  Event: CHANNEL_CREATE\n");
+            break;
+        case DISCORD_EVENT_GUILD_MEMBER_ADD:
+            printf("  Event: GUILD_MEMBER_ADD\n");
             break;
         case DISCORD_EVENT_ERROR:
             printf("  Event: ERROR: %s\n",
-                   ev->error_msg ? ev->error_msg : "unknown");
+                   ev->error_msg[0] ? ev->error_msg : "unknown");
             break;
         default:
             printf("  Event: type=%d\n", ev->type);
@@ -95,7 +113,10 @@ int main(void) {
         .event_queue_size = 64,
         .bot_token = "YOUR_BOT_TOKEN_HERE",
         .api_base_url = NULL,   /* use default https://discord.com/api/v10 */
-        .gateway_url = NULL     /* use default wss://gateway.discord.gg/?v=10&encoding=json */
+        .gateway_url = NULL,    /* use default wss://gateway.discord.gg/?v=10&encoding=json */
+        .intents = 0,           /* 0 = all non-privileged intents */
+        .shard_id = 0,
+        .num_shards = 0
     };
 
     discord_ctx_t *bot = discord_create_with_config(DISCORD_ROLE_CLIENT, &cfg);
@@ -104,7 +125,8 @@ int main(void) {
         return 1;
     }
 
-    printf("Bot context created successfully.\n\n");
+    printf("Bot context created successfully.\n");
+    printf("Gateway state: %d\n\n", discord_gateway_state(bot));
 
     /* Step 2: Prepare a REST API request (create message) */
     printf("--- Creating a message via REST API ---\n");
@@ -155,20 +177,29 @@ int main(void) {
         print_event(&ev);
     }
 
-    /* Step 5: Send heartbeat */
+    /* Step 5: Send heartbeat (caller passes monotonic timestamp) */
     printf("\n--- Sending Gateway heartbeat ---\n");
-    rc = discord_gateway_send_heartbeat(bot, -1);
+    uint64_t now_ms = 1000; /* In real app, use clock_gettime or equivalent */
+    rc = discord_gateway_send_heartbeat(bot, -1, now_ms);
     if (rc != 0) {
         fprintf(stderr, "Failed to send heartbeat\n");
     }
+
+    /* Step 6: Check heartbeat timing */
+    printf("\n--- Heartbeat timing check ---\n");
+    printf("Should send heartbeat now? %s\n",
+           discord_gateway_process_heartbeat(bot, now_ms) ? "yes" : "no");
+    printf("Should send after interval? %s\n",
+           discord_gateway_process_heartbeat(bot, now_ms + 41250) ? "yes" : "no");
 
     printf("\n--- Usage notes ---\n");
     printf("In a real application:\n");
     printf("  1. Send output bytes over TLS to Discord's API/Gateway\n");
     printf("  2. Receive response bytes and feed them back via discord_feed_input\n");
     printf("  3. Process events from discord_next_event\n");
-    printf("  4. Call discord_gateway_process_heartbeat periodically to send heartbeats\n");
+    printf("  4. Call discord_gateway_process_heartbeat(ctx, now_ms) periodically\n");
     printf("  5. Use discord_gateway_send_resume to resume after disconnection\n");
+    printf("  6. Use discord_gateway_state(ctx) to check connection state\n");
 
     discord_destroy(bot);
     printf("\nBot example finished.\n");

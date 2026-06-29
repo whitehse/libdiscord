@@ -1,7 +1,9 @@
 /* fuzz_discord.c — libFuzzer harness for libdiscord
  *
  * Targets (routed by first byte of input):
- *   1. API surface: exercises discord_create_message, edit, delete, get_channel
+ *   1. API surface: exercises discord_create_message, edit, delete, get_channel,
+ *      get_guild, get_channel_messages, add_reaction, create_interaction_response,
+ *      create_dm, create_message_ex
  *   2. Event translation: feeds raw bytes into discord_feed_input and drains events
  *   3. Config fuzzing: exercises create_with_config with various config values
  *
@@ -44,9 +46,20 @@ static void fuzz_api_surface(const uint8_t *data, size_t size) {
 
     /* Exercise each API helper (may fail due to state, that's fine) */
     discord_create_message(ctx, channel_id, content);
+    discord_create_message_ex(ctx, channel_id, content, NULL, NULL);
     discord_edit_message(ctx, channel_id, message_id, content);
     discord_delete_message(ctx, channel_id, message_id);
     discord_get_channel(ctx, channel_id);
+    discord_get_guild(ctx, channel_id);
+    discord_get_channel_messages(ctx, channel_id);
+    discord_add_reaction(ctx, channel_id, message_id, content);
+    discord_delete_own_reaction(ctx, channel_id, message_id, content);
+    discord_create_interaction_response(ctx, channel_id, message_id, content);
+    discord_create_dm(ctx, channel_id);
+
+    /* Exercise new helpers */
+    discord_gateway_state(ctx);
+    discord_set_token(ctx, content);
 
     /* Drain output */
     uint8_t out_buf[4096];
@@ -81,7 +94,7 @@ static void fuzz_event_translation(const uint8_t *data, size_t size) {
 
         /* Exercise gateway helpers (may fail, no crash) */
         if (i & 1) {
-            discord_gateway_send_heartbeat(ctx, (int)data[0]);
+            discord_gateway_send_heartbeat(ctx, (int)data[0], 1000);
         }
 
         discord_destroy(ctx);
@@ -110,10 +123,15 @@ static void fuzz_config_fuzzing(const uint8_t *data, size_t size) {
     memcpy(api_base, data + 1 + tlen, blen);
     api_base[blen] = '\0';
 
+    int intents = (int)(data[0]);
+
     discord_config_t cfg = {
         .event_queue_size = qsize,
         .bot_token = token[0] ? token : NULL,
-        .api_base_url = api_base[0] ? api_base : NULL
+        .api_base_url = api_base[0] ? api_base : NULL,
+        .intents = intents,
+        .shard_id = (int)(data[0] & 0x3),
+        .num_shards = (int)((data[0] >> 2) & 0x3)
     };
 
     /* Create and immediately destroy */
@@ -123,6 +141,12 @@ static void fuzz_config_fuzzing(const uint8_t *data, size_t size) {
         while (discord_next_event(ctx, &ev) == 1) { /* drain */ }
         uint8_t buf[256];
         while (discord_get_output(ctx, buf, sizeof(buf)) > 0) { /* drain */ }
+
+        /* Exercise reset */
+        discord_reset(ctx);
+        while (discord_next_event(ctx, &ev) == 1) { /* drain */ }
+        while (discord_get_output(ctx, buf, sizeof(buf)) > 0) { /* drain */ }
+
         discord_destroy(ctx);
     }
 }

@@ -1,0 +1,127 @@
+.TH DISCORD_TYPES 3 "2026-06-29" "libdiscord 0.2.0" "libdiscord Programmer's Manual"
+.SH NAME
+discord_types \\\\- Discord permission flags, intent bitfields, channel types, and message types
+.SH SYNOPSIS
+.nf
+#include <discord_types.h>
+.fi
+.SH DESCRIPTION
+.B discord_types.h
+defines the fundamental enumerations used throughout libdiscord for Discord protocol constants. These are separated from
+.B discord.h
+to allow lightweight inclusion in type-aware code without pulling in the full API.
+.SH PERMISSION FLAGS
+.B discord_permission_t
+defines the Discord permission bitfield flags (64-bit). These correspond to the permission overwrites in channel and role objects.
+
+.TS
+l l.
+Flag	Bit
+_
+DISCORD_PERM_CREATE_INSTANT_INVITE	1 << 0
+DISCORD_PERM_KICK_MEMBERS	1 << 1
+DISCORD_PERM_BAN_MEMBERS	1 << 2
+DISCORD_PERM_ADMINISTRATOR	1 << 3
+DISCORD_PERM_MANAGE_CHANNELS	1 << 4
+DISCORD_PERM_MANAGE_GUILD	1 << 5
+DISCORD_PERM_ADD_REACTIONS	1 << 6
+DISCORD_PERM_VIEW_AUDIT_LOG	1 << 7
+DISCORD_PERM_SEND_MESSAGES	1 << 11
+DISCORD_PERM_MANAGE_MESSAGES	1 << 13
+DISCORD_PERM_EMBED_LINKS	1 << 14
+DISCORD_PERM_ATTACH_FILES	1 << 15
+DISCORD_PERM_READ_MESSAGE_HISTORY	1 << 16
+DISCORD_PERM_MENTION_EVERYONE	1 << 18
+DISCORD_PERM_USE_EXTERNAL_EMOJIS	1 << 18
+DISCORD_PERM_CONNECT	1 << 20
+DISCORD_PERM_SPEAK	1 << 21
+DISCORD_PERM_MANAGE_ROLES	1 << 28
+DISCORD_PERM_MANAGE_WEBHOOKS	1 << 29
+.TE
+
+.SH CHANNEL TYPES
+.B discord_channel_type_t
+identifies the type of a Discord channel.
+
+.TS
+l l.
+Value	Type
+_
+0	GUILD_TEXT — standard text channel
+1	DM — direct message
+2	GUILD_VOICE — voice channel
+3	GROUP_DM — group direct message
+4	GUILD_CATEGORY — channel category
+5	GUILD_ANNOUNCEMENT — announcement channel
+6	GUILD_STORE — store channel
+13	GUILD_STAGE_VOICE — stage channel
+15	GUILD_FORUM — forum channel
+.TE
+
+.SH MESSAGE TYPES
+.B discord_message_type_t
+identifies the type of a Discord message.
+
+.TS
+l l.
+Value	Type
+_
+0	DEFAULT — normal message
+1	RECIPIENT_ADD — user added to group DM
+2	RECIPIENT_REMOVE — user removed from group DM
+3	CALL — voice/video call
+4	CHANNEL_NAME_CHANGE — channel renamed
+5	CHANNEL_ICON_CHANGE — channel icon changed
+6	CHANNEL_PINNED_MESSAGE — message pinned
+7	GUILD_MEMBER_JOIN — member joined guild
+19	REPLY — message reply
+20	APPLICATION_COMMAND — slash command
+21	THREAD_STARTER_MESSAGE — thread starter
+23	CONTEXT_MENU_COMMAND — context menu command
+.TE
+
+.SH GATEWAY INTENTS
+.B discord_intent_t
+is a bitfield for specifying which Gateway events the bot wants to receive in the identify payload.
+
+.SS Non-privileged intents (always available)
+.TS
+l l.
+Intent	Bit
+_
+DISCORD_INTENT_GUILDS	1 << 0
+DISCORD_INTENT_GUILD_MODERATION	1 << 2
+DISCORD_INTENT_GUILD_EXPRESSIONS	1 << 3
+DISCORD_INTENT_GUILD_INTEGRATIONS	1 << 4
+DISCORD_INTENT_GUILD_WEBHOOKS	1 << 5
+DISCORD_INTENT_GUILD_INVITES	1 << 6
+DISCORD_INTENT_GUILD_VOICE_STATES	1 << 7
+DISCORD_INTENT_GUILD_MESSAGES	1 << 9
+DISCORD_INTENT_GUILD_MESSAGE_REACTIONS	1 << 10
+DISCORD_INTENT_GUILD_MESSAGE_TYPING	1 << 11
+DISCORD_INTENT_DIRECT_MESSAGES	1 << 12
+DISCORD_INTENT_DIRECT_MESSAGE_REACTIONS	1 << 13
+DISCORD_INTENT_DIRECT_MESSAGE_TYPING	1 << 14
+DISCORD_INTENT_GUILD_SCHEDULED_EVENTS	1 << 16
+DISCORD_INTENT_AUTO_MODERATION_CONFIGURATION	1 << 20
+DISCORD_INTENT_AUTO_MODERATION_EXECUTION	1 << 21
+.TE
+
+.SS Privileged intents (require Discord Developer Portal approval)
+.TS
+l l.
+Intent	Bit
+_
+DISCORD_INTENT_GUILD_MEMBERS	1 << 1
+DISCORD_INTENT_GUILD_PRESENCES	1 << 8
+DISCORD_INTENT_MESSAGE_CONTENT	1 << 15
+.TE
+
+.B DISCORD_INTENTS_DEFAULT
+is a convenience macro that combines all non-privileged intents. Used when
+.B discord_config_t.intents
+is set to 0.
+.SH SEE ALSO
+discord_create_with_config(3), discord_gateway_send_identify(3), discord.h(3)
+.SH NOTES
+All values are defined as C enums with explicit integer values to match the Discord API specification. Permission flags use 64-bit values (unsigned long long) to cover bits 0-53 per Discord's spec. Channel and message types use plain int.

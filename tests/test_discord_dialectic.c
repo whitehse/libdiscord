@@ -48,9 +48,7 @@ static int collect_events(discord_ctx_t *ctx, discord_event_t *events, int max_e
     return count;
 }
 
-/* Perform HTTP/2 connection handshake between client and server librest contexts.
- * In real usage, the application drives this over the network.
- * In the dialectic test, we exchange buffers directly. */
+/* Perform HTTP/2 connection handshake between client and server librest contexts. */
 static void http2_handshake(discord_ctx_t *client, discord_ctx_t *server) {
     uint8_t buf[256];
     int n;
@@ -97,7 +95,6 @@ static void http2_handshake(discord_ctx_t *client, discord_ctx_t *server) {
 static void test_rest_api_round_trip(void) {
     printf("  test_rest_api_round_trip...\n");
 
-    /* Use DISCORD_ROLE_SERVER for the "API server" side */
     discord_config_t client_cfg = {
         .event_queue_size = 32,
         .bot_token = "test_bot_token_123"
@@ -144,26 +141,7 @@ static void test_rest_api_round_trip(void) {
     /* Server should see request events */
     discord_event_t server_events[16];
     int server_event_count = collect_events(server, server_events, 16);
-    /* May have request tracked/incoming/headers/data/complete events */
-    /* Just verify no crash — exact events depend on librest behavior */
     (void)server_event_count;
-
-    /* Server: send a response (simulated API response) */
-    /* We use librest's response mechanism via the server discord context */
-    /* For dialectic test, we directly produce a 200 response via rest */
-    /* This is a simplified round-trip — in real usage the API server responds */
-    uint8_t resp_headers_frame[] = {
-        0,0,15,         /* length */
-        1, 0x4,         /* HEADERS + END_HEADERS */
-        0,0,0,1,        /* stream 1 */
-        0x88,           /* :status: 200 */
-        0x00,           /* literal header field without indexing */
-        12, 'c','o','n','t','e','n','t','-','t','y','p','e',
-        16, 'a','p','p','l','i','c','a','t','i','o','n','/','j','s','o','n'
-    };
-    /* This won't work exactly because the frame encoding depends on HPACK state,
-     * but feeding it tests the event translation path */
-    (void)resp_headers_frame;
 
     discord_destroy(client);
     discord_destroy(server);
@@ -215,8 +193,6 @@ static void test_gateway_handshake_simulation(void) {
             found_connected = 1;
         }
     }
-    /* Client should see CONNECTED when binary channel is established */
-    /* (may or may not happen depending on librest's binary channel behavior) */
     (void)found_connected;
 
     discord_destroy(client);
@@ -229,7 +205,6 @@ static void test_multiple_rest_requests(void) {
 
     discord_config_t cfg = { .event_queue_size = 32, .bot_token = "token789" };
 
-    /* Each request needs its own context (REST context is single-request state machine) */
     int total_headers = 0;
     {
         discord_ctx_t *c1 = discord_create_with_config(DISCORD_ROLE_CLIENT, &cfg);
@@ -288,12 +263,145 @@ static void test_multiple_rest_requests(void) {
     printf("  test_multiple_rest_requests PASSED\n");
 }
 
+static void test_new_rest_helpers_produce_frames(void) {
+    printf("  test_new_rest_helpers_produce_frames...\n");
+
+    discord_config_t cfg = { .event_queue_size = 16, .bot_token = "new_helper_token" };
+
+    /* get_guild */
+    {
+        discord_ctx_t *c = discord_create_with_config(DISCORD_ROLE_CLIENT, &cfg);
+        assert(c != NULL);
+        assert(discord_get_guild(c, "guild123") == 0);
+        uint8_t out[4096];
+        int n = drain_output(c, out, sizeof(out));
+        assert(n > 0);
+        int found = 0, pos = 0;
+        while (pos + 9 <= n) {
+            uint32_t flen = ((uint32_t)out[pos] << 16) |
+                            ((uint32_t)out[pos+1] << 8) | (uint32_t)out[pos+2];
+            if (out[pos+3] == 0x1) found++;
+            pos += 9 + (int)flen;
+        }
+        assert(found >= 1);
+        discord_destroy(c);
+    }
+
+    /* get_channel_messages */
+    {
+        discord_ctx_t *c = discord_create_with_config(DISCORD_ROLE_CLIENT, &cfg);
+        assert(c != NULL);
+        assert(discord_get_channel_messages(c, "ch456") == 0);
+        uint8_t out[4096];
+        int n = drain_output(c, out, sizeof(out));
+        assert(n > 0);
+        discord_destroy(c);
+    }
+
+    /* create_interaction_response */
+    {
+        discord_ctx_t *c = discord_create_with_config(DISCORD_ROLE_CLIENT, &cfg);
+        assert(c != NULL);
+        assert(discord_create_interaction_response(c, "inter1", "token1",
+                "{\"type\":4,\"data\":{\"content\":\"pong\"}}") == 0);
+        uint8_t out[4096];
+        int n = drain_output(c, out, sizeof(out));
+        assert(n > 0);
+        discord_destroy(c);
+    }
+
+    /* create_dm */
+    {
+        discord_ctx_t *c = discord_create_with_config(DISCORD_ROLE_CLIENT, &cfg);
+        assert(c != NULL);
+        assert(discord_create_dm(c, "user123") == 0);
+        uint8_t out[4096];
+        int n = drain_output(c, out, sizeof(out));
+        assert(n > 0);
+        discord_destroy(c);
+    }
+
+    /* create_message_ex with embeds */
+    {
+        discord_ctx_t *c = discord_create_with_config(DISCORD_ROLE_CLIENT, &cfg);
+        assert(c != NULL);
+        assert(discord_create_message_ex(c, "ch789", "text",
+                "[{\"title\":\"Embed\"}]", NULL) == 0);
+        uint8_t out[4096];
+        int n = drain_output(c, out, sizeof(out));
+        assert(n > 0);
+        discord_destroy(c);
+    }
+
+    /* add_reaction and delete_own_reaction */
+    {
+        discord_ctx_t *c = discord_create_with_config(DISCORD_ROLE_CLIENT, &cfg);
+        assert(c != NULL);
+        assert(discord_add_reaction(c, "ch1", "msg1", "%F0%9F%91%8D") == 0);
+        uint8_t out1[4096];
+        int n1 = drain_output(c, out1, sizeof(out1));
+        assert(n1 > 0);
+        discord_destroy(c);
+    }
+
+    printf("  test_new_rest_helpers_produce_frames PASSED\n");
+}
+
+static void test_embedded_event_fields(void) {
+    printf("  test_embedded_event_fields...\n");
+
+    /* Verify that event struct uses embedded arrays */
+    discord_event_t ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = DISCORD_EVENT_MESSAGE_CREATE;
+    snprintf(ev.data.message.id, DISCORD_ID_LEN, "123456");
+    snprintf(ev.data.message.content, DISCORD_MSG_CONTENT_LEN, "test content");
+    snprintf(ev.data.message.guild_id, DISCORD_ID_LEN, "guild789");
+
+    /* Verify fields are self-contained */
+    assert(strcmp(ev.data.message.id, "123456") == 0);
+    assert(strcmp(ev.data.message.content, "test content") == 0);
+    assert(strcmp(ev.data.message.guild_id, "guild789") == 0);
+
+    /* Empty guild_id for DMs */
+    discord_event_t dm;
+    memset(&dm, 0, sizeof(dm));
+    dm.type = DISCORD_EVENT_MESSAGE_CREATE;
+    assert(dm.data.message.guild_id[0] == '\0'); /* empty = DM */
+
+    /* API response with body */
+    discord_event_t api;
+    memset(&api, 0, sizeof(api));
+    api.type = DISCORD_EVENT_API_RESPONSE;
+    api.data.api_response.status_code = 200;
+    snprintf(api.data.api_response.json_body, DISCORD_EV_BODY_CAP,
+             "{\"id\":\"msg1\",\"content\":\"hello\"}");
+    api.data.api_response.body_len = strlen(api.data.api_response.json_body);
+    assert(api.data.api_response.status_code == 200);
+    assert(api.data.api_response.body_len > 0);
+    assert(api.data.api_response.truncated == 0);
+
+    /* Interaction event */
+    discord_event_t inter;
+    memset(&inter, 0, sizeof(inter));
+    inter.type = DISCORD_EVENT_INTERACTION_CREATE;
+    inter.data.interaction.type = 2;
+    snprintf(inter.data.interaction.id, DISCORD_ID_LEN, "inter1");
+    snprintf(inter.data.interaction.token, DISCORD_ID_LEN, "tok123");
+    assert(inter.data.interaction.type == 2);
+    assert(strcmp(inter.data.interaction.id, "inter1") == 0);
+
+    printf("  test_embedded_event_fields PASSED\n");
+}
+
 int main(void) {
     printf("libdiscord dialectic test starting...\n");
 
     test_rest_api_round_trip();
     test_gateway_handshake_simulation();
     test_multiple_rest_requests();
+    test_new_rest_helpers_produce_frames();
+    test_embedded_event_fields();
 
     printf("libdiscord dialectic test PASSED.\n");
     return 0;

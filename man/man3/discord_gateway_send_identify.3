@@ -1,0 +1,56 @@
+.TH DISCORD_GATEWAY_SEND_IDENTIFY 3 "2026-06-29" "libdiscord 0.2.0" "libdiscord Programmer's Manual"
+.SH NAME
+discord_gateway_send_identify \\\\- send Gateway identify payload with token, intents, and sharding
+.SH SYNOPSIS
+.nf
+#include <discord.h>
+
+int discord_gateway_send_identify(discord_ctx_t *ctx);
+.fi
+.SH DESCRIPTION
+.B discord_gateway_send_identify
+sends a Gateway identify payload (op 2) containing the bot token, intents bitfield, connection properties, and optional sharding information. The identify payload is sent as a WebSocket text frame via librest.
+
+The payload includes:
+.IP \(bu 2
+.B token
+— the configured bot token
+.IP \(bu 2
+.B intents
+— from
+.BR discord_config_t.intents
+(0 = all non-privileged intents via DISCORD_INTENTS_DEFAULT)
+.IP \(bu 2
+.B properties
+— os, browser, device set to "libdiscord"
+.IP \(bu 2
+.B shard
+— [shard_id, num_shards] if num_shards > 0
+
+This should be called after receiving the Gateway Hello (op 10) and sending the initial heartbeat. On success, the Gateway will respond with READY (dispatch op 0, t="READY").
+.SH RETURN VALUES
+0 on success, -1 on error (NULL ctx, missing librest context, no bot token configured, or output buffer overflow).
+.SH EXAMPLES
+.nf
+discord_config_t cfg = {
+    .event_queue_size = 64,
+    .bot_token = "MTIzNDU2...",
+    .intents = DISCORD_INTENT_GUILDS | DISCORD_INTENT_GUILD_MESSAGES,
+    .shard_id = 0,
+    .num_shards = 2
+};
+discord_ctx_t *bot = discord_create_with_config(DISCORD_ROLE_CLIENT, &cfg);
+discord_gateway_connect(bot);
+/* ... send initial heartbeat ... */
+discord_gateway_send_identify(bot);
+.fi
+.SH SEE ALSO
+discord_create_with_config(3), discord_gateway_connect(3), discord_gateway_send_heartbeat(3), discord_gateway_send_resume(3), discord_types(3)
+.SH NOTES
+The bot token must be configured via
+.BR discord_create_with_config (3)
+or
+.BR discord_set_token (3)
+before calling this function. Discord rate-limits identify calls (max 1000 per day across all shards). Use
+.BR discord_gateway_send_resume (3)
+to reconnect without re-identifying.

@@ -1,0 +1,58 @@
+.TH DISCORD_GATEWAY_CONNECT 3 "2026-06-29" "libdiscord 0.2.0" "libdiscord Programmer's Manual"
+.SH NAME
+discord_gateway_connect \\\\- establish Gateway WebSocket connection via librest binary channel
+.SH SYNOPSIS
+.nf
+#include <discord.h>
+
+int discord_gateway_connect(discord_ctx_t *ctx);
+.fi
+.SH DESCRIPTION
+.B discord_gateway_connect
+initiates a Gateway WebSocket connection by calling librest's
+.B rest_establish_binary_channel
+to perform an HTTP/2 extended CONNECT handshake. On success, the context transitions to
+DISCORD_GW_CONNECTING state (and subsequently to DISCORD_GW_CONNECTED when the binary channel is ready, as reported by the
+.B REST_EVENT_BINARY_CHANNEL_READY
+event from librest).
+
+This is a pure plumbing call — it generates the HTTP/2 extended CONNECT frames but performs no I/O. The caller must send the output bytes over the network (via
+.BR discord_get_output (3))
+and feed responses back (via
+.BR discord_feed_input (3)).
+
+After connection is established, the caller should:
+.IP 1. 3
+Wait for
+.B DISCORD_EVENT_CONNECTED
+event
+.IP 2. 3
+Wait for Gateway Hello (op 10) — heartbeat interval is captured automatically
+.IP 3. 3
+Send identify via
+.BR discord_gateway_send_identify (3)
+.IP 4. 3
+Begin heartbeat loop via
+.BR discord_gateway_process_heartbeat (3)
+.SH RETURN VALUES
+0 on success (frames generated), -1 on error (NULL ctx, missing librest context, or channel establishment failure). On failure, the gateway state resets to DISCORD_GW_DISCONNECTED.
+.SH EXAMPLES
+.nf
+discord_config_t cfg = {
+    .event_queue_size = 64,
+    .bot_token = "MTIzNDU2..."
+};
+discord_ctx_t *bot = discord_create_with_config(DISCORD_ROLE_CLIENT, &cfg);
+
+int rc = discord_gateway_connect(bot);
+if (rc == 0) {
+    /* Extract output frames for network I/O */
+    uint8_t buf[8192];
+    int n = discord_get_output(bot, buf, sizeof(buf));
+    send_to_gateway(buf, n);
+}
+.fi
+.SH SEE ALSO
+discord_create(3), discord_gateway_send_identify(3), discord_gateway_send_heartbeat(3), discord_gateway_state(3), discord_feed_input(3), discord_get_output(3)
+.SH NOTES
+The context must have a valid bot token configured before calling this function. The binary channel establishment uses HTTP/2 extended CONNECT (RFC 8441) to negotiate a WebSocket connection to the Discord Gateway URL.

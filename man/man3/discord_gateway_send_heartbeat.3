@@ -1,0 +1,42 @@
+.TH DISCORD_GATEWAY_SEND_HEARTBEAT 3 "2026-06-29" "libdiscord 0.2.0" "libdiscord Programmer's Manual"
+.SH NAME
+discord_gateway_send_heartbeat \\\\- send Gateway heartbeat with last sequence number
+.SH SYNOPSIS
+.nf
+#include <discord.h>
+
+int discord_gateway_send_heartbeat(discord_ctx_t *ctx, int last_sequence, uint64_t now_ms);
+.fi
+.SH DESCRIPTION
+.B discord_gateway_send_heartbeat
+sends a Gateway heartbeat payload (op 1) to maintain the WebSocket connection. Discord requires heartbeats at the interval specified in the Hello payload (op 10), typically around 41.25 seconds.
+
+.TP
+.B last_sequence
+The last sequence number received from the Gateway. Pass -1 if no sequence has been received yet (the heartbeat payload will use JSON null).
+
+.TP
+.B now_ms
+The current monotonic timestamp in milliseconds, supplied by the caller. This is stored internally for heartbeat timing calculations by
+.BR discord_gateway_process_heartbeat (3).
+
+The heartbeat payload is sent as a WebSocket text frame: \fB{"op":1,"d":<seq_or_null>}\fR.
+.SH RETURN VALUES
+0 on success, -1 on error (NULL ctx or missing librest context). Note: returns -1 if no WebSocket channel is established.
+.SH EXAMPLES
+.nf
+/* In the application's event loop: */
+if (discord_gateway_process_heartbeat(bot, current_time_ms)) {
+    discord_gateway_send_heartbeat(bot, last_seq, current_time_ms);
+    uint8_t buf[512];
+    int n = discord_get_output(bot, buf, sizeof(buf));
+    send_to_gateway(buf, n);
+}
+.fi
+.SH SEE ALSO
+discord_gateway_process_heartbeat(3), discord_gateway_connect(3), discord_gateway_send_identify(3)
+.SH NOTES
+The caller owns all timing logic. The library tracks the last heartbeat timestamp internally (updated by the
+.B now_ms
+parameter) for use by
+.BR discord_gateway_process_heartbeat (3).

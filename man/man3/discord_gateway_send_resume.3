@@ -1,0 +1,55 @@
+.TH DISCORD_GATEWAY_SEND_RESUME 3 "2026-06-29" "libdiscord 0.2.0" "libdiscord Programmer's Manual"
+.SH NAME
+discord_gateway_send_resume \\\\- send Gateway resume payload to reconnect with existing session
+.SH SYNOPSIS
+.nf
+#include <discord.h>
+
+int discord_gateway_send_resume(discord_ctx_t *ctx);
+.fi
+.SH DESCRIPTION
+.B discord_gateway_send_resume
+sends a Gateway resume payload (op 6) to re-establish a disconnected session without re-identifying. The payload includes the bot token, cached session ID (from the previous READY event), and the last known sequence number.
+
+The context caches the session_id and resume_gateway_url from the most recent READY event. After a disconnect (DISCORD_EVENT_DISCONNECTED or DISCORD_EVENT_RECONNECT_REQUEST), the caller should:
+
+.IP 1. 3
+Reconnect via
+.BR discord_gateway_connect (3)
+.IP 2. 3
+Wait for Hello (op 10) and send initial heartbeat
+.IP 3. 3
+Send resume via
+.BR discord_gateway_send_resume (3)
+.IP 4. 3
+If resume succeeds, Gateway sends the missed events. If it fails (op 9, invalid session), re-identify.
+
+The resume payload is: \fB{"op":6,"d":{"token":"...","session_id":"...","seq":N}}\fR.
+.SH RETURN VALUES
+0 on success, -1 on error (NULL ctx, missing librest context, no bot token, or no cached session_id).
+.SH EXAMPLES
+.nf
+/* After disconnection event: */
+discord_event_t ev;
+while (discord_next_event(bot, &ev) == 1) {
+    if (ev.type == DISCORD_EVENT_DISCONNECTED) {
+        discord_gateway_connect(bot);
+        /* ... wait for Hello, send heartbeat ... */
+        if (discord_gateway_send_resume(bot) != 0) {
+            /* Resume failed — re-identify */
+            discord_gateway_send_identify(bot);
+        }
+    }
+    if (ev.type == DISCORD_EVENT_RECONNECT_REQUEST) {
+        /* Server requested reconnect */
+        discord_gateway_connect(bot);
+        discord_gateway_send_resume(bot);
+    }
+}
+.fi
+.SH SEE ALSO
+discord_gateway_connect(3), discord_gateway_send_identify(3), discord_gateway_send_heartbeat(3), discord_reset(3)
+.SH NOTES
+Resume requires a cached session_id from a prior READY event. If no session has been established, this function returns -1. After calling
+.BR discord_reset (3),
+the session_id is cleared and resume is no longer possible (must re-identify).
